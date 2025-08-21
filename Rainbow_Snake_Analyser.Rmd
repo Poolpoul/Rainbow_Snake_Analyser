@@ -1,0 +1,550 @@
+```{r Install and load required packages}
+# 1. Install Spectre + dependencies (if not already installed).
+#    Alternatively, you can run Spectre in its pre-built Docker container 
+#    (see instructions on https://github.com/immunedynamics/spectre).
+
+# install.packages("devtools")   # if not installed yet
+# library(devtools)
+# devtools::install_github("immunedynamics/spectre") 
+
+# 2. Load Spectre + other libraries
+library(Spectre)         # Main Spectre package
+library(data.table)      # High-performance data structure
+library(ggplot2)         # Optional for additional plots
+library(future)
+library(CytoNorm)
+library(flowCore)
+library(FlowSOM)
+library(Spectre)
+
+Spectre::package.check()    # Check required packages
+Spectre::package.load()     # Load required packages
+
+options(cores = 6)
+# Increase memory for future
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
+```
+
+```{r Process datas}
+# Define your project directory 
+setwd("/Users/arthurpoulet/Desktop/PhD/Seurat/CODE_R/Rainbow snake/KSN SAMPLES")
+
+# Create folders for input and output
+dir.create("input_data", showWarnings = FALSE)
+dir.create("output_data", showWarnings = FALSE)
+
+# Input spectral files (FCS or CSV)
+dataDir <- file.path(getwd(), "input_data")
+
+# Directory for results
+outputDir <- file.path(getwd(), "output_data")
+
+# Confirm the input folder contains files
+list.files(dataDir)  # Should list your CSV files
+
+# Read CSV files
+data.list <- Spectre::read.files(file.loc = dataDir,
+                                 file.type = ".csv",
+                                 do.embed.file.names = TRUE)
+
+# Check that files are correctly loaded
+check <- do.list.summary(data.list)
+print(check$name.table)   # Column names per file
+print(check$nrow.check)   # Row count per file
+
+# Merge files into a single object
+cell.dat <- Spectre::do.merge.files(dat = data.list)
+
+# Assign experimental group from filename
+cell.dat[, Group := fifelse(grepl("PBS", FileName, ignore.case=TRUE), "PBS",
+                     fifelse(grepl("J7",  FileName, ignore.case=TRUE), "J7",
+                     fifelse(grepl("J10", FileName, ignore.case=TRUE), "J10",
+                     fifelse(grepl("J12", FileName, ignore.case=TRUE), "J12",
+                     fifelse(grepl("J14", FileName, ignore.case=TRUE), "J14",
+                     fifelse(grepl("J16", FileName, ignore.case=TRUE), "J16", NA_character_))))))]
+
+print(cell.dat)  # Inspect merged data
+
+# Rename channels to marker names
+rename_map <- c(
+  "Comp-APC-A"              = "c-Kit", 
+  "Comp-Pacific Blue-A"      = "Mac-1",
+  "Comp-APC-Fire 750-A"      = "CD105",
+  "Comp-APC-Fire 810-A"      = "CD163",
+  "Comp-Alexa Fluor 700-A"   = "CD41",
+  "Comp-BV421-A"             = "Sca-1",
+  "Comp-BV510-A"             = "CD16_32",
+  "Comp-BV605-A"             = "Ly6C",
+  "Comp-BV650-A"             = "CD80",
+  "Comp-BV711-A"             = "CD48",
+  "Comp-BV785-A"             = "CD150",
+  "Comp-FITC-A"              = "ESAM",
+  "Comp-PE-A"                = "CD93",
+  "Comp-PE-Cy5-A"            = "Flt3",
+  "Comp-PE-Cy7-A"            = "CD34",
+  "Comp-PE-Dazzle594-A"      = "CD127",
+  "Comp-PE-Fire 700-A"       = "CD206",
+  "Comp-PE-Fire 810-A"       = "B220",
+  "Comp-RB744-A"             = "F4_80",
+  "Comp-RB780-A"             = "CD86",
+  "Comp-Spark Blue 550-A"    = "CD45.2",
+  "Comp-Spark Blue 574-A"    = "CD8",
+  "Comp-Spark NIR 685-A"     = "TER 119",
+  "Comp-Spark UV 387-A"      = "CD4",
+  "Comp-Spark UV plus 395-A" = "CD11c",
+  "Comp-Spark YG 581-A"      = "NK1-1",
+  "Comp-Spark YG 593-A"      = "Ly6G",
+  "Comp-DAPI-A"              = "Dapi 5000x",
+  "Comp-EGFP-A"              = "MAP17"
+)
+
+head(cell.dat)
+
+# Step 1: Rename columns
+setnames(cell.dat, old = names(rename_map), new = rename_map, skip_absent = TRUE)
+
+# Step 2: Markers to transform
+to.asinh <- c("FSC-A", "SSC-A", "c-Kit", "Mac-1", "CD105", "CD163", "CD41", "Sca-1", "CD16_32", "Ly6C",
+              "CD80", "CD48", "CD150", "ESAM", "CD93", "Flt3", "CD34", "CD127", "CD206", "B220",
+              "F4_80", "CD86", "CD45.2", "CD8", "TER 119", "CD4", "CD11c", "NK1-1", "Ly6G", "MAP17")
+
+# Step 3: Check missing markers
+missing_cols <- setdiff(to.asinh, names(cell.dat))
+if(length(missing_cols) > 0){
+  cat("Missing columns in cell.dat:\n")
+  print(missing_cols)
+} else {
+  cat("✅ All markers are present in cell.dat\n")
+}
+
+# Step 4: Apply arcsinh transform
+cofactor <- 200
+cell.dat <- do.asinh(cell.dat, to.asinh, cofactor = cofactor)
+
+# Step 5: Transformed column names
+transformed.cols <- paste0(to.asinh, "_asinh")
+
+# Step 6: Quick visualization
+plot.against <- "c-Kit_asinh"
+for(i in transformed.cols){
+  p1 <- make.colour.plot(do.subsample(cell.dat, 5000), i, plot.against)
+  print(p1)
+}
+
+# Step 7: Check groups
+table(cell.dat$Group)
+
+# Reproducibility
+set.seed(42)
+
+# Target sample size
+sample_size <- 15000
+
+# Stratified subsample by group
+cell.sub <- cell.dat[, .SD[sample(.N, min(.N, sample_size * .N / sum(.N)))], by = Group]
+
+cluster.cols <- grep("_asinh$", names(cell.sub), value = TRUE)
+print(cluster.cols)
+
+# Create clustering folder
+dir.create("KSN 1 - clustering")
+setwd("KSN 1 - clustering")
+
+# Test write permissions
+test_file <- file.path(getwd(), "test.txt")
+writeLines("Testing write permissions", con = test_file)
+file.remove(test_file)
+
+# Run FlowSOM clustering
+cell.sub <- run.flowsom(cell.sub, cluster.cols, meta.k = 20)
+
+# Verify group distribution
+table(cell.sub$Group)
+
+# Run UMAP embedding
+cell.sub <- run.umap(cell.sub, cluster.cols)
+
+# Confirm UMAP coordinates added
+print(names(cell.sub))
+
+# Dimensionality reduction plots
+make.colour.plot(cell.sub, "UMAP_X", "UMAP_Y", "FlowSOM_metacluster", col.type = 'factor', add.label = TRUE)
+exp <- do.aggregate(cell.sub, cluster.cols, by = "FlowSOM_metacluster")
+make.pheatmap(exp, "FlowSOM_metacluster", cluster.cols)
+make.multi.plot(cell.sub, "UMAP_X", "UMAP_Y", cluster.cols)
+```
+
+```{r Assign cell ID}
+## ============================================================
+## Quantiles → thresholds (permissive myeloid) + full annotation
+## ============================================================
+library(data.table)
+cell.sub <- as.data.table(cell.sub)
+
+## 1) Build quantiles for all arcsinh markers present
+markers <- grep("_asinh$", names(cell.sub), value = TRUE)
+
+qprobs <- c(0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.99)
+quantiles.df <- rbindlist(lapply(markers, function(m){
+  data.frame(Marker = m, t(quantile(cell.sub[[m]], probs = qprobs, na.rm = TRUE)))
+}))
+setnames(
+  quantiles.df,
+  old = names(quantiles.df)[-1],
+  new = c("Q50","Q60","Q70","Q75","Q80","Q85","Q90","Q95","Q99")
+)
+
+## 2) Data-driven thresholds (defaults + tuned exceptions)
+# Default: Q90
+quantiles.df[, Threshold := Q90]
+
+# Myeloid (more permissive)
+if ("Mac-1_asinh" %in% quantiles.df$Marker)  quantiles.df[Marker=="Mac-1_asinh",  Threshold := Q75]
+if ("Ly6C_asinh" %in% quantiles.df$Marker)   quantiles.df[Marker=="Ly6C_asinh",   Threshold := Q75]
+if ("Ly6G_asinh" %in% quantiles.df$Marker)   quantiles.df[Marker=="Ly6G_asinh",   Threshold := Q80]
+if ("CD11c_asinh" %in% quantiles.df$Marker)  quantiles.df[Marker=="CD11c_asinh",  Threshold := Q80]
+if ("F4_80_asinh" %in% quantiles.df$Marker)  quantiles.df[Marker=="F4_80_asinh",  Threshold := Q75]
+
+# HSPC core markers (slightly permissive to avoid over-stringency)
+if ("c-Kit_asinh"  %in% quantiles.df$Marker) quantiles.df[Marker=="c-Kit_asinh",  Threshold := Q80]
+if ("Sca-1_asinh"  %in% quantiles.df$Marker) quantiles.df[Marker=="Sca-1_asinh",  Threshold := Q80]
+if ("CD34_asinh"   %in% quantiles.df$Marker) quantiles.df[Marker=="CD34_asinh",   Threshold := Q70]
+if ("CD150_asinh"  %in% quantiles.df$Marker) quantiles.df[Marker=="CD150_asinh",  Threshold := Q70]
+if ("CD48_asinh"   %in% quantiles.df$Marker) quantiles.df[Marker=="CD48_asinh",   Threshold := Q70]
+
+# Lineage-priming markers (slightly stricter than myeloid)
+if ("Flt3_asinh"   %in% quantiles.df$Marker) quantiles.df[Marker=="Flt3_asinh",   Threshold := Q80]
+if ("CD127_asinh"  %in% quantiles.df$Marker) quantiles.df[Marker=="CD127_asinh",  Threshold := Q80]
+if ("CD16_32_asinh"%in% quantiles.df$Marker) quantiles.df[Marker=="CD16_32_asinh",Threshold := Q80]
+
+# T/NK stay at Q90 (fine separation)
+# TER119: keep high to only catch leakage in TER119− sorts
+if ("TER 119_asinh" %in% quantiles.df$Marker) quantiles.df[Marker=="TER 119_asinh", Threshold := Q95]
+
+# Optional: fine manual nudges (edit/remove if not needed)
+# for (nm in c("CD41_asinh")) if (nm %in% quantiles.df$Marker) quantiles.df[Marker==nm, Threshold := Q80]
+
+# Named vector of thresholds
+thr <- setNames(quantiles.df$Threshold, quantiles.df$Marker)
+
+# Helpers
+pos <- function(m) {
+  if (!m %in% names(thr) || !m %in% names(cell.sub)) return(rep(FALSE, nrow(cell.sub)))
+  cell.sub[[m]] > thr[[m]]
+}
+q99_of <- function(m) if (m %in% names(cell.sub)) quantiles.df[Marker==m, Q99] else NA_real_
+
+## 3) Reset annotation
+cell.sub[, CellType := NA_character_]
+
+## 4) Erythroid (only to display leakage in TER119− sorts)
+if ("TER 119_asinh" %in% names(cell.sub)) {
+  TERpos <- pos("TER 119_asinh")
+  KITpos <- pos("c-Kit_asinh")
+  cell.sub[ TERpos & !KITpos, CellType := "Erythroid (TER119+ mature)"]
+  cell.sub[ TERpos &  KITpos,  CellType := "Erythroid progenitor (TER119+ KIT+)"]
+}
+
+## 5) Lymphoid (B was sorted out, so only T/NK here)
+cell.sub[ is.na(CellType) & pos("CD4_asinh") & !pos("CD8_asinh"), CellType := "T cell CD4" ]
+cell.sub[ is.na(CellType) & pos("CD8_asinh") & !pos("CD4_asinh"), CellType := "T cell CD8" ]
+cell.sub[ is.na(CellType) & pos("CD4_asinh") &  pos("CD8_asinh"), CellType := "T cell (DP/CD4+CD8+)" ]
+cell.sub[ is.na(CellType) & pos("NK1-1_asinh"),                    CellType := "NK cell" ]
+
+## 6) Myeloid (relaxed)
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh") & pos("Ly6G_asinh"),                      CellType := "Neutrophil (Mac-1+ Ly6G+)" ]
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh") & pos("Ly6C_asinh") & !pos("Ly6G_asinh"), CellType := "Monocyte (Mac-1+ Ly6C+ Ly6G-)" ]
+cell.sub[ is.na(CellType) & pos("CD11c_asinh") & !pos("Ly6G_asinh"),                     CellType := "Dendritic (CD11c+)" ]
+
+## 7) Macrophages
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh") & pos("F4_80_asinh") &
+          (pos("CD206_asinh") | pos("CD163_asinh")),           CellType := "Macrophage M2-like (CD206/CD163)"]
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh") & pos("F4_80_asinh") &
+          (pos("CD80_asinh")  | pos("CD86_asinh")),            CellType := "Macrophage M1-like (CD80/CD86)"]
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh") & pos("F4_80_asinh"), CellType := "Macrophage (F4/80+)" ]
+
+## 8) Megakaryocyte lineage
+cell.sub[ is.na(CellType) & pos("CD41_asinh") & !pos("Sca-1_asinh") &
+          (pos("c-Kit_asinh") | pos("CD105_asinh")),           CellType := "MkP (CD41+ KIT+/CD105+)"]
+
+cd41_q99 <- q99_of("CD41_asinh")
+if (is.finite(cd41_q99)) {
+  cell.sub[ is.na(CellType) & (`CD41_asinh` > cd41_q99) & !pos("Sca-1_asinh"),
+            CellType := "Megakaryocyte (CD41bright)"]
+}
+
+## 9) HSPCs — canonical set (NO ESAM/CD93 in identity)
+KLS    <- pos("c-Kit_asinh") & pos("Sca-1_asinh")
+CD34p  <- pos("CD34_asinh");  CD34n <- !CD34p
+CD150p <- pos("CD150_asinh"); CD150n <- !CD150p
+CD48p  <- pos("CD48_asinh");  CD48n  <- !CD48p
+FLT3p  <- pos("Flt3_asinh")
+IL7Rp  <- pos("CD127_asinh")
+Fcgrp  <- pos("CD16_32_asinh")
+
+# Clear any previous HSPC labels inside KLS only
+cell.sub[KLS & grepl("HSC|MPP|KLS|HSPC", CellType), CellType := NA_character_]
+
+# Order matters: assign most specific first
+# LT-HSC
+cell.sub[KLS & is.na(CellType) & CD34n & CD150p & CD48n, CellType := "HSC-LT"]
+# ST-HSC
+cell.sub[KLS & is.na(CellType) & CD34p & CD150p & CD48n, CellType := "ST-HSC"]
+# MPP6 (subset of MPP4): FLT3+ AND IL7R+
+cell.sub[KLS & is.na(CellType) & CD34p & CD150n & CD48p & FLT3p & IL7Rp, CellType := "MPP6"]
+# MPP5 (myeloid-biased within MPP3 space)
+cell.sub[KLS & is.na(CellType) & CD34p & CD150n & CD48p & !FLT3p & Fcgrp, CellType := "MPP5"]
+# MPP4 (lymphoid-primed: FLT3+ OR IL7R+, excluding MPP6)
+cell.sub[KLS & is.na(CellType) & CD34p & CD150n & CD48p & (FLT3p | IL7Rp), CellType := "MPP4"]
+# MPP3 (default myeloid-primed when CD150− CD48+ CD34+ FLT3− and not FcγR high)
+cell.sub[KLS & is.na(CellType) & CD34p & CD150n & CD48p & !FLT3p, CellType := "MPP3"]
+# MPP2 (CD150+ CD48+)
+cell.sub[KLS & is.na(CellType) & CD34p & CD150p & CD48p, CellType := "MPP2"]
+
+# Fallbacks inside KLS
+cell.sub[KLS & is.na(CellType) & CD34p, CellType := "MPP (other)"]
+cell.sub[KLS & is.na(CellType) & CD34n, CellType := "HSC (other)"]
+
+## 10) Generic myeloid fallback (Mac-1 moderately high)
+cell.sub[ is.na(CellType) & pos("Mac-1_asinh"), CellType := "Myeloid (Mac-1+ mid)"]
+
+## 11) Final fallback
+cell.sub[ is.na(CellType), CellType := "Other/Unassigned"]
+
+## 12) Lineage (clean with fcase)
+cell.sub[, Lineage := fcase(
+  grepl("^Erythroid", CellType),                             "Erythroid",
+  grepl("^T cell", CellType),                                "T cell",
+  grepl("^NK", CellType),                                    "NK",
+  grepl("^Neutrophil|^Monocyte|^Dendritic|^Myeloid", CellType), "Myeloid",
+  grepl("^Macrophage", CellType),                            "Macrophage",
+  grepl("^MkP|^Megakaryocyte", CellType),                    "Megakaryocyte",
+  grepl("^HSC|^ST-HSC|^MPP|^KLS|HSPC", CellType),            "HSPC/Prog",
+  default = "Other"
+)]
+
+## 13) Quick QC
+cat("\nTop CellTypes:\n"); print(sort(table(cell.sub$CellType), decreasing = TRUE)[1:20])
+cat("\nLineage counts:\n"); print(table(cell.sub$Lineage))
+
+library(plotly)
+library(data.table)
+
+# Make sure CellType is a factor with consistent levels
+cell.sub$CellType <- factor(cell.sub$CellType)
+library(plotly)
+library(scales)
+
+# Ensure Group exists and is factor
+lvl <- c("PBS","J7","J10","J12","J14","J16")
+cell.sub$Group <- factor(as.character(cell.sub$Group), levels = lvl)
+
+# Remove rows with NA UMAP or NA Group
+cell.sub.clean <- subset(cell.sub, !is.na(UMAP_X) & !is.na(UMAP_Y) & !is.na(Group))
+
+# Stable palette
+ct_levels <- sort(unique(cell.sub.clean$CellType))
+pal <- setNames(hue_pal()(length(ct_levels)), ct_levels)
+
+```
+```{r plot options , echo=FALSE}
+library(plotly)
+library(data.table)
+
+# Function for dynamic 2D UMAP visualization
+plot_2D_UMAP <- function(group_variable) {
+  plot_ly(
+    data = cell.sub, 
+    x = ~UMAP_X, 
+    y = ~UMAP_Y, 
+    color = cell.sub[[group_variable]],   # Color by selected group
+    type = 'scatter',
+    mode = 'markers',
+    marker = list(size = 3, opacity = 0.8)
+  ) %>% layout(title = paste("2D UMAP Colored by", group_variable))
+}
+
+# Example Usage:
+plot_2D_UMAP("Group")  #PBS, J7, J10...
+plot_2D_UMAP("FlowSOM_metacluster")  # Clusters
+
+
+
+#Group and Time vizualisation 
+
+# Make sure CellType is a factor with consistent levels
+cell.sub$CellType <- factor(cell.sub$CellType)
+
+# Ensure Group exists and is factor
+lvl <- c("PBS","J7","J10","J12","J14","J16")
+cell.sub$Group <- factor(as.character(cell.sub$Group), levels = lvl)
+
+# Remove rows with NA UMAP or NA Group
+cell.sub.clean <- subset(cell.sub, !is.na(UMAP_X) & !is.na(UMAP_Y) & !is.na(Group))
+
+# Stable palette
+ct_levels <- sort(unique(cell.sub.clean$CellType))
+pal <- setNames(hue_pal()(length(ct_levels)), ct_levels)
+
+# Animated UMAP (SVG, not scattergl)
+p8 <- plot_ly(
+  data   = cell.sub.clean,
+  x      = ~UMAP_X,
+  y      = ~UMAP_Y,
+  frame  = ~Group,
+  color  = ~CellType,
+  colors = pal,
+  type   = "scatter",
+  mode   = "markers",
+  marker = list(size = 3, opacity = 0.7),
+  text   = ~paste("Group:", Group, "<br>CellType:", CellType),
+  hoverinfo = "text"
+) %>%
+  layout(
+    title = "UMAP evolution across groups (PBS → J7 → J10 → …)",
+    xaxis = list(title = "UMAP_X"),
+    yaxis = list(title = "UMAP_Y"),
+    legend = list(itemsizing = "constant")
+  ) %>%
+  animation_opts(frame = 600, transition = 0, redraw = FALSE) %>%
+  animation_slider(currentvalue = list(prefix = "Time: "))
+
+p8
+
+#checkboxes celltypes / time 
+library(plotly)
+library(crosstalk)
+library(scales)
+
+## 1) Clean inputs
+lvl_time <- c("PBS","J7","J10","J12","J14","J16")
+cell.sub$Group    <- factor(as.character(cell.sub$Group), levels = lvl_time)
+cell.sub$CellType <- factor(as.character(cell.sub$CellType))   # keep your labels
+
+df <- subset(cell.sub, !is.na(UMAP_X) & !is.na(UMAP_Y) & !is.na(Group) & !is.na(CellType))
+
+## 2) SharedData keyed by row (for filtering)
+sd <- SharedData$new(df, key = ~seq_len(nrow(df)), group = "umapCT")
+
+## 3) Stable palette for time (Group)
+grp_cols <- setNames(
+  c("#1f77b4","#2ca02c","#ff7f0e","#9467bd","#8c564b","#e377c2")[seq_len(length(lvl_time))],
+  lvl_time
+)
+
+## 4) The plot (colors by Group / time)
+p <- plot_ly(
+  data   = sd,
+  x = ~UMAP_X, y = ~UMAP_Y,
+  type = "scattergl", mode = "markers",
+  color = ~Group, colors = grp_cols, hoverinfo = "text",
+  marker = list(size = 2.5, opacity = 0.75),
+  text = ~paste0("CellType: ", CellType, "<br>Group: ", Group)
+) %>%
+  layout(
+    title = "UMAP — colors = Group (time); filter by CellType (checkboxes)",
+    xaxis = list(title = "UMAP_X", zeroline = TRUE, zerolinecolor = "gray"),
+    yaxis = list(title = "UMAP_Y", zeroline = TRUE, zerolinecolor = "gray"),
+    legend = list(title = list(text = "Group"))
+  )
+
+## 5) CellType checkboxes (multi-select)
+# If your crosstalk version supports `selected=`, keep it; if you get an
+# "unused argument (selected=...)" error, remove the `selected` line.
+ft <- try(
+  filter_checkbox(
+    id = "celltypes",
+    label = "Cell types",
+    sharedData = sd,
+    ~CellType,
+    inline = FALSE,
+    columns = 1,
+    selected = levels(df$CellType)   # <— remove this line if your crosstalk errors
+  ),
+  silent = TRUE
+)
+
+if (inherits(ft, "try-error")) {
+  # fallback that always works: a multi-select dropdown
+  ft <- filter_select(
+    id = "celltypes",
+    label = "Cell types",
+    sharedData = sd,
+    ~CellType,
+    multiple = TRUE
+  )
+}
+
+## 6) Put filters on the left and plot on the right
+crosstalk::bscols(widths = c(3, 9), ft, p)
+
+library(plotly)
+library(crosstalk)
+library(scales)
+library(data.table)
+
+# ---- 0) Prep: factors with fixed levels ----------------------
+lvl_time <- c("PBS","J7","J10","J12","J14","J16")
+cell.sub$Group    <- factor(as.character(cell.sub$Group), levels = lvl_time)
+cell.sub$CellType <- factor(as.character(cell.sub$CellType))
+
+# keep rows with coordinates + labels
+df <- as.data.table(cell.sub)[!is.na(UMAP_X) & !is.na(UMAP_Y) & !is.na(Group) & !is.na(CellType)]
+df[, RowID := .I]                      # <- global unique key
+
+groups_present <- levels(droplevels(df$Group))
+ct_levels      <- levels(droplevels(df$CellType))
+
+# stable palette for ALL traces, regardless of current subset
+pal <- setNames(hue_pal()(length(ct_levels)), ct_levels)
+
+# ---- 1) One controller SharedData (drives the checkboxes) ----
+sd_ctrl <- SharedData$new(df, key = ~RowID, group = "umapCT")
+
+# CellType checkboxes (multi-select). If your crosstalk version errors on `selected=`,
+# just leave that argument out.
+ft_ct <- filter_checkbox(
+  id = "ct",
+  label = "Cell types",
+  sharedData = sd_ctrl,
+  ~CellType,
+  inline = FALSE,
+  columns = 1
+  # selected = ct_levels
+)
+
+# ---- 2) One SharedData per Group (all share group="umapCT") ---
+sd_list <- lapply(groups_present, function(g){
+  SharedData$new(df[Group == g], key = ~RowID, group = "umapCT")
+})
+
+# ---- 3) One plot per Group, colors = CellType -----------------
+plots <- Map(function(sd_g, g){
+  plot_ly(
+    data  = sd_g,
+    x = ~UMAP_X, y = ~UMAP_Y,
+    type = "scattergl", mode = "markers",
+    color = ~CellType, colors = pal,
+    marker = list(size = 2.5, opacity = 0.75),
+    text = ~paste0("Group: ", g, "<br>CellType: ", CellType),
+    hoverinfo = "text",
+    showlegend = FALSE
+  ) %>% layout(title = g)
+}, sd_list, groups_present)
+
+# ---- 4) Arrange grid ------------------------------------------
+ncols  <- 3
+nrows  <- ceiling(length(plots)/ncols)
+
+p_grid <- subplot(
+  plots,
+  nrows = nrows, shareX = TRUE, shareY = TRUE, titleX = TRUE, titleY = TRUE
+) %>% layout(
+  title = "UMAP by Group — check CellTypes to overlay across time",
+  xaxis = list(title = "UMAP_X", zeroline = TRUE, zerolinecolor = "gray"),
+  yaxis = list(title = "UMAP_Y", zeroline = TRUE, zerolinecolor = "gray"),
+  margin = list(l = 40, r = 10, t = 50, b = 40)
+)
+
+bscols(widths = c(3, 9), ft_ct, p_grid)
+```
